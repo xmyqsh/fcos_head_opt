@@ -1,12 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import Scale
+from mmcv.cnn import Scale, normal_init
 from mmcv.runner import force_fp32
 
 from mmdet.core import distance2bbox, multi_apply, multiclass_nms, reduce_mean
 from ..builder import HEADS, build_loss
 from .anchor_free_head import AnchorFreeHead
+
+from mmcv.ops.nms import batched_nms
+from functools import partial
 
 INF = 1e8
 
@@ -76,29 +79,26 @@ class FCOSHeadOpt(AnchorFreeHead):
                      use_sigmoid=True,
                      loss_weight=1.0),
                  norm_cfg=dict(type='GN', num_groups=32, requires_grad=True),
-                 init_cfg=dict(
-                     type='Normal',
-                     layer='Conv2d',
-                     std=0.01,
-                     override=dict(
-                         type='Normal',
-                         name='conv_cls',
-                         std=0.01,
-                         bias_prob=0.01)),
                  **kwargs):
         self.regress_ranges = regress_ranges
         self.center_sampling = center_sampling
         self.center_sample_radius = center_sample_radius
         self.norm_on_bbox = norm_on_bbox
         self.centerness_on_reg = centerness_on_reg
+
         super().__init__(
             num_classes,
             in_channels,
             loss_cls=loss_cls,
             loss_bbox=loss_bbox,
             norm_cfg=norm_cfg,
-            init_cfg=init_cfg,
             **kwargs)
+
+        self.pre_nms_num = self.test_cfg.nms_pre
+        self.pre_nms_thres = self.test_cfg.score_thr
+        self.post_nms_num = self.test_cfg.max_per_img
+        self.nms = self.test_cfg.nms
+
         self.loss_centerness = build_loss(loss_centerness)
 
     def _init_layers(self):
@@ -106,6 +106,11 @@ class FCOSHeadOpt(AnchorFreeHead):
         super()._init_layers()
         self.conv_centerness = nn.Conv2d(self.feat_channels, 1, 3, padding=1)
         self.scales = nn.ModuleList([Scale(1.0) for _ in self.strides])
+
+    def init_weights(self):
+        """Initialize weights of the head."""
+        super().init_weights()
+        normal_init(self.conv_centerness, std=0.01)
 
     def forward(self, feats):
         """Forward features from the upstream network.
@@ -192,10 +197,9 @@ class FCOSHeadOpt(AnchorFreeHead):
         """
         points = self.get_points(bbox_preds, bbox_preds[0].dtype,
                                  bbox_preds[0].device)
-        # TODO(ljm): dig into this func
-        with torch.no_grad():
-            labels, bbox_targets, centerness_targets, pos_inds, pos_num, points \
-                = self.get_targets(points, gt_bboxes, gt_labels)
+
+        labels, bbox_targets, centerness_targets, pos_inds, pos_num \
+            = self.get_targets(points, gt_bboxes, gt_labels)
 
         # (B*N, x)
         cls_scores, bbox_preds, centernesses = \
@@ -206,24 +210,19 @@ class FCOSHeadOpt(AnchorFreeHead):
                                           .reshape(-1, xs[0].shape[1]),
                           [cls_scores, bbox_preds, centernesses]))
 
-        bbox_preds, centernesses, points = \
-            bbox_preds[pos_inds], centernesses[pos_inds], points[pos_inds]
-
-        decoded_bbox_targets, decoded_bbox_preds = \
-            tuple(map(lambda x: torch.cat([pos_points - x[:, :2],
-                                           pos_points + x[:, 2:]], dim=1),
-                      [bbox_targets, bbox_preds]))
+        bbox_preds, centernesses = bbox_preds[pos_inds], centernesses[pos_inds]
+        bbox_targets[:, :2], bbox_preds[:, :2] = -bbox_targets[:, :2], -bbox_preds[:, :2]
 
         centerness_denorm = centerness_targets.sum().detach()
-        pos_num, centerness_denorm = tuple(map(lambda x, eps: max(reduce_mean(x), eps)), [pos_num, centerness_denorm], [1.0, 1e-6])
+        pos_num, centerness_denorm = tuple(map(lambda x, eps: max(reduce_mean(x), eps), [pos_num, centerness_denorm], [1.0, 1e-6]))
 
         loss_cls = self.loss_cls(cls_scores, labels, avg_factor=pos_num)
 
-        loss_bbox = self.loss_bbox(decoded_bbox_preds, decoded_bbox_targets,
-                                   weight=centerness_targets,
+        loss_bbox = self.loss_bbox(bbox_preds, bbox_targets,
+                                   weight=centerness_targets.squeeze(-1),
                                    avg_factor=centerness_denorm)
 
-        loss_centerness = self.loss_centerness(centernesses, centerness_targets, avg_factor=pos_num)
+        loss_centerness = self.loss_centerness(centernesses.squeeze(-1), centerness_targets, avg_factor=pos_num)
 
         return dict(loss_cls=loss_cls,
                     loss_bbox=loss_bbox,
@@ -278,22 +277,23 @@ class FCOSHeadOpt(AnchorFreeHead):
     def get_bboxes_single_image(self, bbox, score, label, keep, img_meta):
         bbox, score, label = bbox[keep], score[keep], label[keep]
         det, keep = batched_nms(bbox, score, label, self.nms)
-        det, keep = det[self.pos_nms_num], keep[self.pos_nms_num]
+        det, keep = det[:self.post_nms_num], keep[:self.post_nms_num]
         label = label[keep]
         # TODO(ljm): move this func into a proper place
         def post_process(bbox, img_meta):
             (h, w), scale_factor = img_meta['img_shape'][:2], img_meta['scale_factor']
-            bbox[:, :4] = bbox[:, 4] * scale_factor
+            # NOTE(ljm): bbox.clone() is useless here
             bbox[:, [0, 2]] = bbox[:, [0, 2]].clamp(min=0, max=w)
             bbox[:, [1, 3]] = bbox[:, [1, 3]].clamp(min=0, max=h)
-        det = post_process(det, img_meta)
+            bbox[:, :4] = bbox[:, :4] / bbox.new_tensor(scale_factor)
+        post_process(det, img_meta)
         return det, label
 
     def get_bboxes_single_level(self, bbox_pred, score, centerness, point):
         bbox_pred, score, centerness = tuple(map(lambda x: x.reshape(*x.shape[:2], -1) \
                                                            .permute(0, 2, 1),
                                                  [bbox_pred, score, centerness]))
-        score, centerness = score.sigmoid(), centerness=centerness.sigmoid()
+        score, centerness = score.sigmoid(), centerness.sigmoid()
         B, N, C = score.shape
         # TODO(ljm): cache points with batch B
         point = point.unsqueeze(0).expand(B, -1, 2)
@@ -302,17 +302,27 @@ class FCOSHeadOpt(AnchorFreeHead):
         keep = score > self.pre_nms_thres
         B_inds, NC_inds = keep.nonzero(as_tuple=True)
         num_scores, score_keep = keep.sum(dim=-1), score[keep]
-        score = score.new_zeros(B, max(num_scores))
-        pos_inds = NC_inds.new_zeros(B, max(num_scores))
-        start = 0
-        for idx, num_score in enumerate(num_scores):
-            end = start + num_score
-            score[idx, :num_score] = score_keep[start:end]
-            pos_inds[idx, :num_score] = NC_inds[start:end]
-            start = end
+        max_num_scores = max(num_scores)
 
-        score, score_inds = score.topk(self.pre_nms_num, dim=-1, sorted=False) # (B, K)
-        score_inds = pos_inds[:, score_inds]
+        if B > 1:
+            score = score.new_zeros(B, max_num_scores)
+            pos_inds = NC_inds.new_zeros(B, max_num_scores)
+            start = 0
+            for idx, num_score in enumerate(num_scores):
+                end = start + num_score
+                score[idx, :num_score] = score_keep[start:end]
+                pos_inds[idx, :num_score] = NC_inds[start:end]
+                start = end
+        else:
+            score = score_keep.view(1, -1)
+            pos_inds = NC_inds.view(1, -1)
+
+        if max_num_scores > self.pre_nms_num:
+            score, score_inds = score.topk(self.pre_nms_num, dim=-1, sorted=False) # (B, K)
+            batch_inds = torch.arange(B).view(-1, 1).expand_as(score_inds).long()
+            score_inds = pos_inds[batch_inds, score_inds]
+        else:
+            score_inds = pos_inds
         pos_inds, label = score_inds // C, score_inds % C
 
         batch_inds = torch.arange(B).view(-1, 1).expand_as(pos_inds).long()
@@ -321,17 +331,14 @@ class FCOSHeadOpt(AnchorFreeHead):
         point = point[batch_inds, pos_inds, :]
 
         keep = score > self.pre_nms_thres
-        score = (score * centerness).sqrt()
+        score = (score * centerness.squeeze(-1)).sqrt()
         bbox = torch.cat([point - bbox_pred[..., :2],
                           point + bbox_pred[..., 2:]], dim=-1)
         return bbox, score, label, keep
 
     def get_points(self, featmaps, dtype, device, flatten=False):
         # TODO(ljm): cache list, instead of return iterator
-        return list(map(self._get_points_single, featmaps, self.strides,
-                                                 dtype=dtype,
-                                                 device=device,
-                                                 flatten=flatten))
+        return list(map(partial(self._get_points_single, dtype=dtype, device=device, flatten=flatten), featmaps, self.strides))
 
     def _get_points_single(self,
                            featmap,
@@ -365,22 +372,22 @@ class FCOSHeadOpt(AnchorFreeHead):
                 concat_lvl_bbox_targets (list[Tensor]): BBox targets of each \
                     level.
         """
-        num_points, regress_ranges = \
-            multi_apply(lambda point, regress_range: point.shape[0],
-                                                     point.new_tensor(regress_range) \
-                                                          .unsqueeze(0) \
-                                                          .expand_as(point),
-                        points, self.regress_ranges)
+        num_points = list(map(lambda point: point.shape[0], points))
+        regress_ranges = \
+            list(map(lambda point, regress_range: point.new_tensor(regress_range) \
+                                                       .unsqueeze(0) \
+                                                       .expand_as(point),
+                        points, self.regress_ranges))
         points, regress_ranges = tuple(map(partial(torch.cat, dim=0),
                                            [points, regress_ranges]))
         num_gts = list(map(lambda x: x.shape[0], gt_labels_list))
         B, max_num_gt = len(num_gts), max(num_gts)
 
         gt_bboxes, gt_labels = \
-            tuple(map(lambda xs: points.new_zeros(B, max_num_gt, *xs[0].shape[1:]),
+            tuple(map(lambda xs: xs[0].new_zeros(B, max_num_gt, *xs[0].shape[1:]),
                       [gt_bboxes_list, gt_labels_list]))
 
-        for idx, num_gt in emunerate(num_gts):
+        for idx, num_gt in enumerate(num_gts):
             gt_bboxes[idx, :num_gt] = gt_bboxes_list[idx]
             gt_labels[idx, :num_gt] = gt_labels_list[idx]
 
@@ -409,12 +416,14 @@ class FCOSHeadOpt(AnchorFreeHead):
         else:
             is_in_bbox = bbox_targets.min(dim=-1)[0] > 0
 
-        if self.norm_on_bbox:
-            bbox_targets = bbox_targets / strides
+        del points
 
         max_bbox_targets = bbox_targets.max(dim=-1)[0]
         is_in_regress_range = ((max_bbox_targets >= regress_ranges[..., 0]) & \
                                (max_bbox_targets <= regress_ranges[..., 1]))
+
+        if self.norm_on_bbox:
+            bbox_targets = bbox_targets / stride
 
         wh = gt_bboxes[..., 2:] - gt_bboxes[..., :2]
         areas = wh[..., 0] * wh[..., 1]
@@ -423,7 +432,7 @@ class FCOSHeadOpt(AnchorFreeHead):
         areas, gt_labels = tuple(map(lambda x: x.expand_as(is_in_bbox), [areas, gt_labels]))
         areas = areas.contiguous()
 
-        areas[~is_in_bbox or ~is_in_regress_range] = INF
+        areas[~(is_in_bbox & is_in_regress_range)] = INF
 
         # (B*N, max_num_gt, 1/4)
         areas, gt_labels, bbox_targets = \
@@ -432,13 +441,13 @@ class FCOSHeadOpt(AnchorFreeHead):
         # (B*N)
         min_area, min_area_inds = areas.min(dim=-1)
 
-        batch_inds = torch.arange(B).view(-1, 1).expand_as(pos_inds).long()
-        labels = gt_labels[batch_inds, min_area_inds]
+        B_inds = torch.arange(gt_labels.shape[0], device=gt_labels.device).long()
+        labels = gt_labels[B_inds, min_area_inds]
         labels[min_area == INF] = self.num_classes
-        bbox_targets = bbox_targets[batch_inds, min_area_inds]
+        bbox_targets = bbox_targets[B_inds, min_area_inds]
 
         pos_inds = ((labels >= 0) & (labels < self.num_classes)).nonzero().squeeze(-1)
-        pos_num = bbox_targets.new_tensor(pos_inds.shape[0])
+        pos_num = bbox_targets.new_tensor([pos_inds.shape[0]])
 
         bbox_targets = bbox_targets[pos_inds]
 
@@ -446,6 +455,4 @@ class FCOSHeadOpt(AnchorFreeHead):
         centerness_targets = (left_right.min(dim=-1)[0] / left_right.max(dim=-1)[0] *
                               top_bottom.min(dim=-1)[0] / top_bottom.max(dim=-1)[0]).sqrt()
 
-        points = points.expand(B, *points.shape[1:]).reshape(-1, points.shape[-1])
-
-        return labels, bbox_targets, centerness_targets, pos_inds, pos_num, points
+        return labels, bbox_targets, centerness_targets, pos_inds, pos_num
